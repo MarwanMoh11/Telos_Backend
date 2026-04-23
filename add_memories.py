@@ -8,7 +8,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 from datetime import datetime, timezone
 
 CHROMA_PATH = "./chroma_local"
-USER_ID     = "mahmoud"
+USER_ID     = "marwan"
 
 local_ef = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
 client   = chromadb.PersistentClient(path=CHROMA_PATH)
@@ -46,8 +46,21 @@ if to_add:
             for m in to_add
         ],
     )
-    print(f"✅ Added {len(to_add)} new memories.")
+    print(f"✅ Added {len(to_add)} new memories for '{USER_ID}'.")
+
+# ── Migration (Migrate from old mahmoud ID) ──────────────────
+old_data = collection.get(where={"user_id": "mahmoud"})
+if old_data["ids"]:
+    print(f"🔄 Migrating {len(old_data['ids'])} memories from 'mahmoud' to '{USER_ID}'...")
+    collection.update(
+        ids=old_data["ids"],
+        metadatas=[{**m, "user_id": USER_ID} for m in old_data["metadatas"]]
+    )
+    print("✅ Migration complete.")
 else:
+    print("ℹ️ No old memories found for migration.")
+
+if not to_add and not old_data["ids"]:
     print("ℹ️ All memories already exist, nothing added.")
 
 # ── Show all memories in DB ─────────────────────────────────
