@@ -15,7 +15,7 @@ import uuid
 CHROMA_PATH = "./chroma_local"
 
 # Llama (local/remote) config
-LLM_BASE_URL = "http://10.7.57.198:8000"
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434")
 LLM_ENDPOINT = f"{LLM_BASE_URL}/v1/chat/completions"
 
 # Gemini (online) config
@@ -143,7 +143,7 @@ PERSONALIZATION:
 
 # ─── Step 3a: Call Llama via OpenAI-compatible API ──────────────────────────────
 def call_llama(system_prompt: str, user_message: str, history: list[dict] = [],
-               model: str = "default", temperature: float = 0.7, max_tokens: int = 1024) -> str:
+               model: str = "gemma4:e2b", temperature: float = 0.7, max_tokens: int = 1024) -> str:
     """
     Send a chat completion request to the local Llama LLM endpoint.
     """
