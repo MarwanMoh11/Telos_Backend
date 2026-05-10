@@ -7,6 +7,8 @@ and sends it to the LLM (Llama local or Gemini online).
 import os
 import requests
 import chromadb
+import json
+import re
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from datetime import datetime, timezone
 import uuid
@@ -110,7 +112,7 @@ def save_memory(user_id: str, text: str, eeg_state: str = "unknown"):
 
 
 # ─── Step 2: Build the system prompt with RAG context ──────────────────────────
-def build_system_prompt(memories: list[dict], current_eeg: str = None) -> str:
+def build_system_prompt(memories: list[dict], current_eeg: str = None, game_context: str = None) -> str:
     """
     Build a Lumi system prompt enriched with retrieved memories and current EEG.
     """
@@ -121,10 +123,19 @@ def build_system_prompt(memories: list[dict], current_eeg: str = None) -> str:
 
     eeg_info = f"CURRENT BRAIN STATE: {current_eeg or 'Unknown'}"
 
+    game_instruction = ""
+    if game_context:
+        game_instruction = f"""
+GAME CONTEXT:
+{game_context}
+You can choose to comment on the game or continue the conversation. If you choose not to say anything, simply output exactly: [SILENCE]
+"""
+
     return f"""You are Lumi, a supportive and empathetic mental health companion for university students.
 Your role is to help students manage stress, burnout, and emotional wellbeing.
 
 {eeg_info}
+{game_instruction}
 
 CONCISENESS RULES:
 - BE EXTREMELY BRIEF AND CONCISE. 
@@ -208,7 +219,7 @@ def call_gemini(system_prompt: str, user_message: str, history: list[dict] = [],
 
 # ─── Step 3: Unified LLM dispatcher ────────────────────────────────────────────
 def call_llm(system_prompt: str, user_message: str, history: list[dict] = [],
-             model: str = "default", temperature: float = 0.7, max_tokens: int = 1024) -> str:
+             model: str = "gemma4:e2b", temperature: float = 0.7, max_tokens: int = 1024) -> str:
     """
     Route to the active LLM provider (Llama or Gemini).
     """
@@ -219,7 +230,7 @@ def call_llm(system_prompt: str, user_message: str, history: list[dict] = [],
 
 
 # ─── Full Pipeline ──────────────────────────────────────────────────────────────
-def ask_telos(user_id: str, query: str, eeg_state: str = None, history: list[dict] = []) -> str:
+def ask_telos(user_id: str, query: str, eeg_state: str = None, history: list[dict] = [], game_context: str = None) -> str:
     """
     End-to-end: User query → RAG retrieves memories → LLM responds → Save memory.
     """
@@ -239,19 +250,116 @@ def ask_telos(user_id: str, query: str, eeg_state: str = None, history: list[dic
     
     # Step 2: Build prompt
     print("\n[Step 2] Building prompt with context...")
-    system_prompt = build_system_prompt(memories, eeg_state)
+    system_prompt = build_system_prompt(memories, eeg_state, game_context)
 
     # Step 3: Call LLM
     target = GEMINI_MODEL if LLM_PROVIDER == "gemini" else LLM_ENDPOINT
     print(f"\n[Step 3] Dispatching to {LLM_PROVIDER.upper()}...")
     print(f"  Model/Endpoint: {target}")
     answer = call_llm(system_prompt, query, history)
+    print(f"  Response Preview: {answer[:60]}...")
     
-    # Step 4: Save this new interaction to long-term memory
-    save_memory(user_id, query, eeg_state)
+    # Save the interaction to memory only if it's an actual user query (not a silent game tick)
+    if not game_context or "[SILENCE]" not in answer:
+        save_memory(user_id, f"User asked: {query} | Telos replied: {answer}", eeg_state)
 
-    print(f"\n💬 Lumi says: {answer[:60]}...")
     return answer
+
+
+# ─── Burnout Engine ─────────────────────────────────────────────────────────────
+def calculate_burnout_index(user_id: str, eeg_state: str = None, history: list = None) -> dict:
+    """
+    Calculate a burnout index from 0.0 to 1.0 based on RAG history, live EEG, and recent conversation flow.
+    """
+    # Retrieve recent memories related to stress
+    memories = get_memories(user_id, "stress burnout tired exhausted overwhelmed", eeg_state)
+    
+    # Base burnout is 0.5. Add 0.2 if we found multiple stressful memories.
+    base_burnout = 0.5
+    if len(memories) >= 2:
+        base_burnout += 0.2
+
+    # Conversation flow modifier using LLM
+    if history:
+        user_msgs = [msg["content"] for msg in history if msg.get("role") == "user"][-3:]
+        if user_msgs:
+            print(f"  🔍 Analyzing conversation tone for {len(user_msgs)} messages...")
+            conversation_text = "\n".join(f"- {msg}" for msg in user_msgs)
+            sys_prompt = "Analyze the tone of these messages. If the user is stressed, tired, or overwhelmed, reply only 'STRESSED'. If they are happy or relaxed, reply only 'POSITIVE'. Else reply 'NEUTRAL'."
+            try:
+                # Use a slightly higher temperature for variety but keep max_tokens low
+                raw_response = call_llm(sys_prompt, conversation_text, max_tokens=10)
+                tone = raw_response.strip().upper()
+                print(f"  🧠 Raw Tone Response: '{tone}'")
+                
+                if "STRESSED" in tone:
+                    base_burnout += 0.6  # Significant weight to override other factors
+                elif "POSITIVE" in tone:
+                    base_burnout -= 0.3
+            except Exception as e:
+                print(f"  ❌ Tone Deduction Failed: {e}")
+                
+    # Real-time EEG modifiers
+    if eeg_state == 'high_stress':
+        base_burnout += 0.3
+    elif eeg_state == 'focused':
+        base_burnout -= 0.3
+        
+    # Clamp between 0.0 and 1.0
+    base_burnout = max(0.0, min(1.0, base_burnout))
+    
+    return {
+        "burnout_index": round(base_burnout, 2),
+        "recommended_difficulty": round(1.0 - base_burnout, 2)
+    }
+
+
+# ─── Step 5: Generate Adaptive Daily Check-In ──────────────────────────────────
+def generate_daily_checkin(user_id: str) -> list[str]:
+    """
+    Generate 3 adaptive questions based on user memories, formatted as JSON.
+    """
+    print(f"\n[Check-In] Generating daily check-in for '{user_id}'...")
+    memories = get_memories(user_id, "stress focus goals feelings daily checkin", n=5)
+    
+    memory_lines = "\n".join(f"- {m['text']} (State: {m['eeg']})" for m in memories)
+    
+    system_prompt = f"""You are a mental health companion app.
+Based on the following recent memories of the user, generate EXACTLY 3 highly personalized, short daily check-in questions to ask them right now.
+Return ONLY a valid JSON array of strings. Do not use markdown blocks or any other text.
+If there are no memories, just return 3 general well-being questions.
+
+Memories:
+{memory_lines}
+"""
+    answer = call_llm(system_prompt, "Generate 3 daily check-in questions as a JSON array of strings.")
+    
+    try:
+        # Extract JSON array using regex in case LLM wraps it in markdown
+        match = re.search(r'\[.*\]', answer, re.DOTALL)
+        if match:
+            questions = json.loads(match.group(0))
+        else:
+            questions = json.loads(answer)
+            
+        if not isinstance(questions, list) or len(questions) == 0:
+            raise ValueError("Not a valid JSON array or empty.")
+            
+        # Ensure we return strings
+        questions = [str(q) for q in questions][:3]
+        
+        # Pad if less than 3
+        while len(questions) < 3:
+            questions.append("Is there anything else on your mind today?")
+            
+        return questions
+    except Exception as e:
+        print(f"  ❌ LLM JSON parse failed: {e}. Output was: {answer}")
+        return [
+            "How are you feeling right now?",
+            "What is your main focus for today?",
+            "Is there anything causing you stress?"
+        ]
 
 
 # ─── Entry Point for Testing ───────────────────────────────────────────────────

@@ -7,7 +7,7 @@ import json
 import random
 
 # Import existing logic
-from telos_rag_llm import ask_telos, set_llm_provider, set_gemini_api_key, get_llm_provider
+from telos_rag_llm import ask_telos, set_llm_provider, set_gemini_api_key, get_llm_provider, generate_daily_checkin, save_memory, calculate_burnout_index
 from eeg_synthesizer import generate_multichannel_eeg
 
 app = FastAPI(title="Telos Backend API")
@@ -29,12 +29,22 @@ class ChatRequest(BaseModel):
     user_id: str = "marwan"
     message: str
     eeg_state: str = None
+    history: list = []
+    game_context: str = None
+    burnout_index: float = 0.0
 
 @app.get("/")
 async def root():
     provider = get_llm_provider()
     model_label = "Gemini (Online)" if provider == "gemini" else "Llama-3 (Remote)"
     return {"status": "Telos API is online", "model": model_label, "provider": provider}
+
+
+@app.get("/burnout-index")
+async def get_burnout_index(user_id: str = "marwan", eeg_state: str = None):
+    """Returns the burnout index and recommended game difficulty."""
+    history = session_history.get(user_id, [])
+    return calculate_burnout_index(user_id, eeg_state, history)
 
 
 class ProviderRequest(BaseModel):
@@ -77,15 +87,16 @@ async def chat_endpoint(request: ChatRequest):
     try:
         uid = request.user_id
         
-        # 1. Get existing history for this session
-        history = session_history.get(uid, [])
+        # 1. Get existing history for this session (prioritize frontend history if provided)
+        history = request.history[-MAX_HISTORY:] if request.history else session_history.get(uid, [])
         
         # 2. Call the RAG pipeline with history
         response = ask_telos(
             user_id=uid,
             query=request.message,
             eeg_state=request.eeg_state,
-            history=history
+            history=history,
+            game_context=request.game_context
         )
         
         # 3. Update history (Append user query and assistant response)
@@ -102,6 +113,31 @@ async def chat_endpoint(request: ChatRequest):
         }
     except Exception as e:
         print(f"Server Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class CheckInAnswers(BaseModel):
+    user_id: str = "marwan"
+    q_and_a: list[dict] # [{"q": "...", "a": "..."}]
+    eeg_state: str = None
+
+@app.get("/generate-checkin")
+async def get_checkin(user_id: str = "marwan"):
+    try:
+        questions = generate_daily_checkin(user_id)
+        return {"questions": questions}
+    except Exception as e:
+        print(f"Error generating checkin: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/submit-checkin")
+async def submit_checkin(request: CheckInAnswers):
+    try:
+        for item in request.q_and_a:
+            memory_text = f"Daily Check-In -> Q: {item.get('q')} | A: {item.get('a')}"
+            save_memory(request.user_id, memory_text, request.eeg_state)
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Error saving checkin: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/stream-eeg")
